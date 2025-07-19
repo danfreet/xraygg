@@ -8,9 +8,12 @@ for cmd in curl unzip; do
   if ! command -v "$cmd" &> /dev/null; then
     echo "❌ Требуется установить: $cmd"
     echo "👉 Пример: sudo apt install $cmd"
-    exit 1
+    MISSING=true
   fi
 done
+if [[ "$MISSING" == true ]]; then
+  exit 1
+fi
 
 # === Значения по умолчанию ===
 PORT=443
@@ -60,8 +63,8 @@ if [ ! -f "./xray" ]; then
   esac
   mkdir -p ./xray-tmp
   curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH_DL}.zip
-  unzip xray.zip -d ./xray-tmp
-  mv ./xray-tmp/xray ./xray && chmod +x ./xray
+  unzip xray.zip -d ./xray-tmp || { echo "❌ Не удалось распаковать xray.zip"; exit 1; }
+  mv ./xray-tmp/xray ./xray && chmod +x ./xray || { echo "❌ Не удалось переместить Xray"; exit 1; }
   mv ./xray-tmp/geo* .
   rm -rf xray.zip xray-tmp
 fi
@@ -72,7 +75,7 @@ if [ ! -f "./xray" ]; then
 fi
 
 # === Генерация Reality ключей ===
-KEYS=$(./xray x25519)
+KEYS=$(./xray x25519 2>/dev/null)
 PRIVATE_KEY=$(echo "$KEYS" | grep "Private" | awk '{print $3}')
 PUBLIC_KEY=$(echo "$KEYS" | grep "Public" | awk '{print $3}')
 SHORT_ID="12345678"
