@@ -1,74 +1,102 @@
 #!/bin/bash
 
-# === Автоустановка Xray ===
-if [ ! -f "./xray" ]; then
-  echo "📥 Xray не найден, скачиваем последнюю версию..."
-  ARCH=$(uname -m)
+# Удаление символов Windows-конца строки, если вдруг есть
+[ -n "$(command -v dos2unix)" ] && dos2unix "$0" 2>/dev/null
 
+# === Проверка зависимостей ===
+for cmd in curl unzip; do
+  if ! command -v "$cmd" &> /dev/null; then
+    echo "❌ Требуется установить: $cmd"
+    echo "👉 Пример: sudo apt install $cmd"
+    exit 1
+  fi
+done
+
+# === Значения по умолчанию ===
+PORT=443
+SNI="www.google.com"
+MY_IP=""
+CLIENTS=()
+INSTALL_SERVICE=false
+
+# === Парсинг аргументов ===
+print_help() {
+  echo "\nUsage: bash xraygg-installer.sh [OPTIONS]\n"
+  echo "Options:"
+  echo "  --port <port>             Указать порт (по умолчанию 443)"
+  echo "  --sni <domain>            Указать SNI домен (по умолчанию www.google.com)"
+  echo "  --ip <your_ip>            Внешний IP адрес сервера"
+  echo "  --client <name>           Добавить клиента (можно указывать несколько раз)"
+  echo "  --install-service         Установить systemd-сервис для автозапуска"
+  echo "  -h, --help                Показать эту справку\n"
+  exit 0
+}
+
+while [[ "$#" -gt 0 ]]; do
+  case $1 in
+    --port) PORT="$2"; shift 2;;
+    --sni) SNI="$2"; shift 2;;
+    --ip) MY_IP="$2"; shift 2;;
+    --client) CLIENTS+=("$2"); shift 2;;
+    --install-service) INSTALL_SERVICE=true; shift;;
+    -h|--help) print_help;;
+    *) echo "Неизвестный параметр: $1"; print_help;;
+  esac
+done
+
+if [[ -z "$MY_IP" ]]; then
+  echo "❌ Укажите внешний IP с помощью --ip"
+  exit 1
+fi
+
+# === Скачивание Xray ===
+echo "📥 Проверка Xray..."
+if [ ! -f "./xray" ]; then
+  ARCH=$(uname -m)
   case "$ARCH" in
     x86_64) ARCH_DL="64";;
     aarch64) ARCH_DL="arm64-v8a";;
     *) echo "❌ Неподдерживаемая архитектура: $ARCH"; exit 1;;
   esac
-
+  mkdir -p ./xray-tmp
   curl -L -o xray.zip https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH_DL}.zip
-  unzip xray.zip xray geo* -d ./xray-tmp
-  mv ./xray-tmp/xray ./xray
-  chmod +x ./xray
-  mv ./xray-tmp/geo* ./
+  unzip xray.zip -d ./xray-tmp
+  mv ./xray-tmp/xray ./xray && chmod +x ./xray
+  mv ./xray-tmp/geo* .
   rm -rf xray.zip xray-tmp
-  echo "✅ Xray установлен"
 fi
 
-# === Ввод основных параметров ===
-read -p "Введите порт для сервера (по умолчанию 443): " PORT
-PORT=${PORT:-443}
+if [ ! -f "./xray" ]; then
+  echo "❌ Не удалось скачать и распаковать Xray."
+  exit 1
+fi
 
-read -p "Введите SNI-домен (например, www.cloudflare.com): " SNI
-SNI=${SNI:-www.cloudflare.com}
-
-read -p "Введите внешний IP сервера: " MY_IP
-
-# === Генерация Reality-ключей ===
-REALITY_KEYS=$(./xray x25519)
-PRIVATE_KEY=$(echo "$REALITY_KEYS" | grep "Private key:" | awk '{print $3}')
-PUBLIC_KEY=$(echo "$REALITY_KEYS" | grep "Public key:" | awk '{print $3}')
+# === Генерация Reality ключей ===
+KEYS=$(./xray x25519)
+PRIVATE_KEY=$(echo "$KEYS" | grep "Private" | awk '{print $3}')
+PUBLIC_KEY=$(echo "$KEYS" | grep "Public" | awk '{print $3}')
 SHORT_ID="12345678"
 
 echo "🔑 Reality ключи сгенерированы:"
 echo "   Private: $PRIVATE_KEY"
 echo "   Public : $PUBLIC_KEY"
-echo ""
 
-# === Ввод клиентов ===
+# === Генерация клиентов ===
 CLIENTS_JSON=""
 LINKS=""
 
-while true; do
-  read -p "Введите имя клиента (или оставьте пустым для завершения): " NAME
-  [ -z "$NAME" ] && break
-
+for NAME in "${CLIENTS[@]}"; do
   UUID=$(cat /proc/sys/kernel/random/uuid)
-  CLIENTS_JSON="$CLIENTS_JSON
-          {
-            \"id\": \"$UUID\",
-            \"flow\": \"\",
-            \"email\": \"$NAME\"
-          },"
-  VLESS_LINK="vless://$UUID@$MY_IP:$PORT?encryption=none&flow=&type=tcp&security=reality&fp=chrome&pbk=$PUBLIC_KEY&sid=$SHORT_ID&sni=$SNI&alpn=h2#$NAME"
-  LINKS="$LINKS
-$VLESS_LINK"
+  CLIENTS_JSON+="
+          { \"id\": \"$UUID\", \"flow\": \"\", \"email\": \"$NAME\" },"
+  LINKS+=$'\n'"vless://$UUID@$MY_IP:$PORT?encryption=none&security=reality&type=tcp&fp=chrome&pbk=$PUBLIC_KEY&sid=$SHORT_ID&sni=$SNI&alpn=h2#$NAME"
 done
-
-# Удаляем последнюю запятую
 CLIENTS_JSON=$(echo "$CLIENTS_JSON" | sed '$ s/},/}/')
 
 # === Генерация config.json ===
 cat > config.json <<EOF
 {
-  "log": {
-    "loglevel": "warning"
-  },
+  "log": { "loglevel": "warning" },
   "inbounds": [
     {
       "port": $PORT,
@@ -86,34 +114,24 @@ $CLIENTS_JSON
           "show": false,
           "dest": "$SNI:443",
           "xver": 0,
-          "serverNames": ["$SNI"],
+          "serverNames": [ "$SNI" ],
           "privateKey": "$PRIVATE_KEY",
-          "shortIds": ["$SHORT_ID"]
+          "shortIds": [ "$SHORT_ID" ]
         }
       }
     }
   ],
-  "outbounds": [
-    {
-      "protocol": "freedom"
-    }
-  ]
+  "outbounds": [ { "protocol": "freedom" } ]
 }
 EOF
 
 # === Вывод ссылок ===
-echo ""
-echo "✅ Конфигурация сохранена в config.json"
-echo ""
-echo "📌 VLESS Reality ссылки для клиентов:"
-echo "$LINKS"
+echo "\n✅ Конфигурация сохранена в config.json"
+echo "\n📌 VLESS Reality ссылки для клиентов:" && echo "$LINKS"
 
-# === Установка Xray как systemd-сервис ===
-read -p "Создать systemd-сервис для автозапуска Xray? (y/n): " ENABLE_SERVICE
-
-if [[ "$ENABLE_SERVICE" == "y" || "$ENABLE_SERVICE" == "Y" ]]; then
-  echo "🛠️ Устанавливаем systemd-сервис..."
-
+# === Установка systemd-сервиса ===
+if [[ "$INSTALL_SERVICE" == true ]]; then
+  echo "\n🛠️ Установка systemd-сервиса..."
   sudo mkdir -p /etc/xray
   sudo cp ./xray /etc/xray/xray
   sudo cp ./geo* /etc/xray/
@@ -138,13 +156,10 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
-  sudo systemctl daemon-reexec
   sudo systemctl daemon-reload
   sudo systemctl enable xray
   sudo systemctl start xray
-
-  echo "✅ Сервис 'xray' установлен и запущен!"
-  echo "ℹ️ Управление: sudo systemctl [start|stop|restart|status] xray"
+  echo "✅ systemd-сервис установлен и запущен."
 else
   echo "⏭️ Пропущено создание systemd-сервиса."
 fi
